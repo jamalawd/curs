@@ -1,15 +1,20 @@
 # curs
 
-Switch Cursor accounts. Skills, plugins, and hooks stay shared.
+Switch Cursor accounts so work and personal usage stay on the right bill.
+Skills, plugins, and hooks stay shared.
+
+I have been using this for a while to keep PAYGO and API credits on the
+account that should pay for them. Sharing it in case it is useful to someone
+else.
+
+The normal Cursor app is one login. Extra profiles get their own login, MCP
+tokens, User Rules, and usage. `~/.cursor` and `~/.agents` stay shared.
 
 ```text
 curs                  # pick an account
 curs work             # launch a profile
 curs list             # who is signed in where
 ```
-
-The normal Cursor app is one login. Extra profiles get their own login, MCP
-tokens, and User Rules. `~/.cursor` and `~/.agents` stay shared.
 
 ## Install
 
