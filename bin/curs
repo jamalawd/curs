@@ -204,25 +204,56 @@ profile_dir() {
   if [[ "$slug" == "default" ]]; then
     default_user_data_dir
   else
-    printf '%s' "$PROFILES_DIR/$slug"
+    assert_usable_slug "$slug"
+    printf '%s/%s' "$PROFILES_DIR" "$slug"
   fi
+}
+
+assert_inside_profiles() {
+  local dest="$1"
+  local root real
+  mkdir -p "$PROFILES_DIR"
+  root="$(cd "$PROFILES_DIR" && pwd -P)"
+  if [[ -d "$dest" ]]; then
+    real="$(cd "$dest" && pwd -P)"
+  else
+    real="$(cd "$(dirname "$dest")" && pwd -P)/$(basename "$dest")"
+  fi
+  case "$real" in
+    "$root"/*) ;;
+    *) die "Refusing to touch a path outside $PROFILES_DIR" ;;
+  esac
+}
+
+cursor_db_field() {
+  local db="$1"
+  local key="$2"
+  [[ -f "$db" ]] || return 0
+  require_python
+  REGISTRY="${REGISTRY:-$PROFILES_DIR/registry.json}" python3 - "$db" "$key" <<'PY'
+import os, sqlite3, sys
+db, key = sys.argv[1], sys.argv[2]
+con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+try:
+    row = con.execute(
+        "SELECT value FROM ItemTable WHERE key = ? LIMIT 1", (key,)
+    ).fetchone()
+    if row and row[0]:
+        print(row[0])
+finally:
+    con.close()
+PY
 }
 
 profile_email() {
   local dir="$1"
-  local db="$dir/User/globalStorage/state.vscdb"
-  [[ -f "$db" ]] || return 0
-  command -v sqlite3 >/dev/null 2>&1 || return 0
-  sqlite3 "$db" "SELECT value FROM ItemTable WHERE key = 'cursorAuth/cachedEmail' LIMIT 1;" 2>/dev/null || true
+  cursor_db_field "$dir/User/globalStorage/state.vscdb" "cursorAuth/cachedEmail"
 }
 
 profile_signed_in() {
   local dir="$1"
-  local db="$dir/User/globalStorage/state.vscdb"
-  [[ -f "$db" ]] || return 1
-  command -v sqlite3 >/dev/null 2>&1 || return 1
   local auth
-  auth="$(sqlite3 "$db" "SELECT value FROM ItemTable WHERE key = 'adminSettings.cachedAuthId' LIMIT 1;" 2>/dev/null || true)"
+  auth="$(cursor_db_field "$dir/User/globalStorage/state.vscdb" "adminSettings.cachedAuthId")"
   [[ -n "$auth" ]]
 }
 
@@ -268,8 +299,12 @@ is_reserved_slug() {
 
 assert_usable_slug() {
   local slug="$1"
-  valid_slug "$slug" || die "Invalid profile name: $slug. Use a letter, then letters, numbers, dots, underscores, or hyphens."
-  is_reserved_slug "$slug" && die "\"$slug\" is a reserved command name. Pick another profile name."
+  if ! valid_slug "$slug"; then
+    die "Invalid profile name: \"$slug\". Use a letter, then letters, numbers, dots, underscores, or hyphens."
+  fi
+  if is_reserved_slug "$slug"; then
+    die "\"$slug\" is a reserved command name. Pick another profile name."
+  fi
 }
 
 # --- help -------------------------------------------------------------------
@@ -468,9 +503,11 @@ remove_profile() {
   parse_kv_args "$@"
   [[ -n "$SLUG" ]] || die "Usage: curs rm <name> [--yes]"
   [[ "$SLUG" == "default" ]] && die "The primary profile cannot be removed."
+  assert_usable_slug "$SLUG"
   registry_exists "$SLUG" || [[ -d "$PROFILES_DIR/$SLUG" ]] || die "Unknown profile: $SLUG"
 
   local dir="$PROFILES_DIR/$SLUG"
+  assert_inside_profiles "$dir"
   if [[ "$FORCE" -ne 1 ]]; then
     [[ -t 0 ]] || die "Refusing to delete \"$SLUG\" without --yes."
     read -r -p "Delete profile \"$SLUG\" and $dir? [y/N] " confirm
@@ -478,8 +515,10 @@ remove_profile() {
   fi
 
   ensure_registry
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    rm -rf "$dir"
+  fi
   registry remove "$SLUG"
-  rm -rf "$dir"
   say_ok "Removed profile \"$SLUG\"."
 }
 
@@ -541,9 +580,11 @@ launch_profile() {
 show_which() {
   local slug="${1:-default}"
   if [[ "$slug" != "default" ]]; then
+    assert_usable_slug "$slug"
     if ! registry_exists "$slug" && [[ ! -d "$PROFILES_DIR/$slug" ]]; then
       die "Unknown profile: $slug"
     fi
+    assert_inside_profiles "$(profile_dir "$slug")"
   fi
   printf '%s\n' "$(profile_dir "$slug")"
 }
@@ -592,17 +633,18 @@ pick_profile() {
       "${C_GREEN}${default_mail}${C_RESET}" \
       "${C_DIM}(primary)${C_RESET}"
 
-    local i=1 s label email line
-    for s in "${slugs[@]}"; do
-      label="$(registry_field "$s" "label")"
-      email="$(profile_email "$PROFILES_DIR/$s")"
-      [[ -z "$email" ]] && email="$(registry_field "$s" "email")"
-      line="${C_BLUE}${C_BOLD}${s}${C_RESET}"
-      [[ -n "$label" && "$label" != "$s" ]] && line="$line ${C_DIM}-${C_RESET} ${C_DIM}${label}${C_RESET}"
-      [[ -n "$email" ]] && line="$line  ${C_GREEN}(${email})${C_RESET}"
-      printf '  %b%d)%b %b\n' "$C_YELLOW" "$i" "$C_RESET" "$line"
-      i=$((i + 1))
-    done
+    local i=1 s label status line
+    if [[ ${#slugs[@]} -gt 0 ]]; then
+      for s in "${slugs[@]}"; do
+        label="$(registry_field "$s" "label")"
+        status="$(profile_status "$s")"
+        line="${C_BLUE}${C_BOLD}${s}${C_RESET}"
+        [[ -n "$label" && "$label" != "$s" ]] && line="$line ${C_DIM}-${C_RESET} ${C_DIM}${label}${C_RESET}"
+        [[ -n "$status" ]] && line="$line  $(color_status "$status")${status}${C_RESET}"
+        printf '  %b%d)%b %b\n' "$C_YELLOW" "$i" "$C_RESET" "$line"
+        i=$((i + 1))
+      done
+    fi
 
     printf '\n  %bn)%b %bNew profile%b\n' "$C_YELLOW" "$C_RESET" "$C_GREEN" "$C_RESET"
     printf '  %b?)%b %bHelp%b\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
