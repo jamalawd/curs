@@ -1,0 +1,37 @@
+#compdef curs
+
+_curs() {
+  local -a commands profiles
+  commands=(
+    'add:create a profile'
+    'default:launch the primary Cursor install'
+    'edit:update a profile'
+    'help:show help'
+    'install:symlink into ~/.local/bin'
+    'list:show profiles'
+    'rm:delete a profile'
+    'version:print version'
+    'which:print a profile data directory'
+  )
+  profiles=(${(f)"$(curs --complete-profiles 2>/dev/null)"})
+
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'command' commands
+    _describe -t profiles 'profile' profiles
+    return
+  fi
+
+  case "${words[2]}" in
+    edit | rm | remove | delete | which)
+      _describe -t profiles 'profile' profiles
+      ;;
+    add)
+      _arguments \
+        '--label[Display label]:label' \
+        '--email[Sign-in hint]:email' \
+        '--launch[Launch after creating]'
+      ;;
+  esac
+}
+
+_curs "$@"

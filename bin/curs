@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+# curs: switch Cursor IDE accounts.
+# Isolated login per profile. Shared ~/.cursor and ~/.agents.
+set -euo pipefail
+
+VERSION="1.0.0"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+PROFILES_DIR="${CURSOR_PROFILES_DIR:-$HOME/.cursor-profiles}"
+REGISTRY="$PROFILES_DIR/registry.json"
+
+RESERVED_SLUGS=(
+  add default delete doctor edit help install list ls
+  new remove rm version which
+)
+
+# --- colors -----------------------------------------------------------------
+
+init_colors() {
+  if [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" || ! -t 1 ]]; then
+    C_RESET= C_BOLD= C_DIM= C_CYAN= C_GREEN= C_YELLOW= C_MAGENTA= C_BLUE= C_RED=
+    return
+  fi
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_MAGENTA=$'\033[35m'
+  C_BLUE=$'\033[34m'
+  C_RED=$'\033[31m'
+}
+
+init_colors
+
+say_ok() { printf '%b\n' "${C_GREEN}${C_BOLD}$*${C_RESET}"; }
+say_warn() { printf '%b\n' "${C_YELLOW}$*${C_RESET}"; }
+say_err() { printf '%b\n' "${C_RED}${C_BOLD}$*${C_RESET}" >&2; }
+say_info() { printf '%b\n' "${C_CYAN}$*${C_RESET}"; }
+say_dim() { printf '%b\n' "${C_DIM}$*${C_RESET}"; }
+die() { say_err "$*"; exit 1; }
+
+help_row() {
+  printf '  %b%-28s%b %s\n' "$C_YELLOW" "$1" "$C_RESET" "$2"
+}
+
+color_status() {
+  local status="$1"
+  if [[ "$status" == *"(hint)"* || "$status" == *"(new)"* || "$status" == *"not signed"* ]]; then
+    printf '%s' "$C_YELLOW"
+  elif [[ "$status" == *"@"* ]]; then
+    printf '%s' "$C_GREEN"
+  else
+    printf '%s' "$C_DIM"
+  fi
+}
+
+# --- environment ------------------------------------------------------------
+
+default_user_data_dir() {
+  if [[ -n "${CURSOR_DEFAULT_USER_DATA_DIR:-}" ]]; then
+    printf '%s' "$CURSOR_DEFAULT_USER_DATA_DIR"
+    return
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s' "$HOME/Library/Application Support/Cursor" ;;
+    Linux) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Cursor" ;;
+    *)
+      die "Unsupported OS: $(uname -s). Set CURSOR_DEFAULT_USER_DATA_DIR to your Cursor user data directory."
+      ;;
+  esac
+}
+
+resolve_cursor_bin() {
+  local cand
+  if [[ -n "${CURSOR_BIN:-}" ]]; then
+    if [[ -x "$CURSOR_BIN" ]]; then
+      printf '%s' "$CURSOR_BIN"
+      return
+    fi
+    cand="$(command -v "$CURSOR_BIN" 2>/dev/null || true)"
+    if [[ -n "$cand" && -x "$cand" ]]; then
+      printf '%s' "$cand"
+      return
+    fi
+    die "CURSOR_BIN is set but not executable: $CURSOR_BIN"
+  fi
+
+  for cand in \
+    "$(command -v cursor 2>/dev/null || true)" \
+    "/Applications/Cursor.app/Contents/Resources/app/bin/cursor" \
+    "$HOME/.local/bin/cursor" \
+    "/usr/local/bin/cursor" \
+    "/usr/bin/cursor"
+  do
+    if [[ -n "$cand" && -x "$cand" ]]; then
+      printf '%s' "$cand"
+      return
+    fi
+  done
+
+  die "Cursor CLI not found. Install Cursor, or set CURSOR_BIN to the cursor executable."
+}
+
+require_python() {
+  command -v python3 >/dev/null 2>&1 || die "curs requires python3."
+}
+
+# --- registry ---------------------------------------------------------------
+
+ensure_registry() {
+  mkdir -p "$PROFILES_DIR"
+  if [[ ! -f "$REGISTRY" ]]; then
+    printf '%s\n' '{"version":1,"profiles":{}}' >"$REGISTRY"
+  fi
+}
+
+registry() {
+  require_python
+  REGISTRY="$REGISTRY" python3 - "$@" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+
+path = os.environ["REGISTRY"]
+cmd, args = sys.argv[1], sys.argv[2:]
+
+def load():
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+def save(data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+def now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def profiles(data):
+    return data.setdefault("profiles", {})
+
+if cmd == "slugs":
+    for slug in sorted(load().get("profiles", {})):
+        print(slug)
+elif cmd == "exists":
+    sys.exit(0 if args[0] in load().get("profiles", {}) else 1)
+elif cmd == "get":
+    entry = load().get("profiles", {}).get(args[0], {})
+    if len(args) > 1:
+        print(entry.get(args[1], "") or "")
+    else:
+        print(json.dumps(entry))
+elif cmd == "upsert":
+    slug = args[0]
+    data = load()
+    entry = profiles(data).get(slug, {})
+    i = 1
+    while i < len(args):
+        key, value = args[i], args[i + 1]
+        if value == "":
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+        i += 2
+    entry.setdefault("created_at", now())
+    data["profiles"][slug] = entry
+    save(data)
+elif cmd == "touch":
+    data = load()
+    if args[0] in data.get("profiles", {}):
+        data["profiles"][args[0]]["last_opened_at"] = now()
+        save(data)
+elif cmd == "remove":
+    data = load()
+    data.get("profiles", {}).pop(args[0], None)
+    save(data)
+else:
+    raise SystemExit(f"unknown registry command: {cmd}")
+PY
+}
+
+registry_slugs() {
+  ensure_registry
+  registry slugs
+}
+
+registry_exists() {
+  ensure_registry
+  registry exists "$1"
+}
+
+registry_field() {
+  ensure_registry
+  registry get "$1" "$2"
+}
+
+# --- profile state ----------------------------------------------------------
+
+profile_dir() {
+  local slug="$1"
+  if [[ "$slug" == "default" ]]; then
+    default_user_data_dir
+  else
+    printf '%s' "$PROFILES_DIR/$slug"
+  fi
+}
+
+profile_email() {
+  local dir="$1"
+  local db="$dir/User/globalStorage/state.vscdb"
+  [[ -f "$db" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 "$db" "SELECT value FROM ItemTable WHERE key = 'cursorAuth/cachedEmail' LIMIT 1;" 2>/dev/null || true
+}
+
+profile_signed_in() {
+  local dir="$1"
+  local db="$dir/User/globalStorage/state.vscdb"
+  [[ -f "$db" ]] || return 1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  local auth
+  auth="$(sqlite3 "$db" "SELECT value FROM ItemTable WHERE key = 'adminSettings.cachedAuthId' LIMIT 1;" 2>/dev/null || true)"
+  [[ -n "$auth" ]]
+}
+
+profile_status() {
+  local slug="$1"
+  local dir email hint
+
+  dir="$(profile_dir "$slug")"
+  email="$(profile_email "$dir")"
+  if [[ -n "$email" ]]; then
+    printf '%s' "$email"
+    return
+  fi
+
+  if [[ "$slug" != "default" ]]; then
+    hint="$(registry_field "$slug" "email")"
+    if [[ -n "$hint" ]]; then
+      printf '%s (hint)' "$hint"
+      return
+    fi
+  fi
+
+  if profile_signed_in "$dir"; then
+    printf '%s' "(signed in)"
+  elif [[ -d "$dir/User" ]]; then
+    printf '%s' "(not signed in)"
+  else
+    printf '%s' "(new)"
+  fi
+}
+
+valid_slug() {
+  [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9._-]*$ ]]
+}
+
+is_reserved_slug() {
+  local want="$1" name
+  for name in "${RESERVED_SLUGS[@]}"; do
+    [[ "$name" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+assert_usable_slug() {
+  local slug="$1"
+  valid_slug "$slug" || die "Invalid profile name: $slug. Use a letter, then letters, numbers, dots, underscores, or hyphens."
+  is_reserved_slug "$slug" && die "\"$slug\" is a reserved command name. Pick another profile name."
+}
+
+# --- help -------------------------------------------------------------------
+
+show_version() {
+  printf 'curs %s\n' "$VERSION"
+}
+
+show_help() {
+  local default_mail
+  default_mail="$(profile_email "$(default_user_data_dir)")"
+  [[ -n "$default_mail" ]] || default_mail="your primary Cursor account"
+
+  printf '\n%b\n' "${C_BOLD}${C_CYAN}curs${C_RESET}  ${C_DIM}v${VERSION}${C_RESET}"
+  printf '%b\n\n' "${C_DIM}Switch Cursor accounts. Skills, plugins, and hooks stay shared.${C_RESET}"
+
+  printf '%b\n' "${C_BOLD}Quick start${C_RESET}"
+  help_row "curs" "interactive account picker"
+  help_row "curs default" "primary Cursor install (${default_mail})"
+  help_row "curs <profile>" "launch a named profile"
+  help_row "curs list" "show profiles and sign-in status"
+
+  printf '\n%b\n' "${C_BOLD}Launch${C_RESET}"
+  help_row "curs <profile> [path]" "open a folder with that account"
+  help_row "cursor" "same as primary (no curs needed)"
+
+  printf '\n%b\n' "${C_BOLD}Manage${C_RESET}"
+  help_row "curs add <name>" "create a profile"
+  help_row "curs add work --email you@x.com" "create with a sign-in hint"
+  help_row "curs edit <name>" "update label or email hint"
+  help_row "curs rm <name>" "delete a profile"
+  help_row "curs which [name]" "print the user-data directory"
+
+  printf '\n%b\n' "${C_BOLD}Other${C_RESET}"
+  help_row "curs install" "symlink this script to ~/.local/bin/curs"
+  help_row "curs help" "show this help"
+  help_row "curs version" "print the version"
+
+  printf '\n%b\n' "${C_BOLD}Profiles${C_RESET}"
+  printf '  %b%-12s%b %s  %s\n' \
+    "$C_MAGENTA" "default" "$C_RESET" \
+    "${C_GREEN}${default_mail}${C_RESET}" \
+    "${C_DIM}(primary Cursor install)${C_RESET}"
+
+  local slug label email
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    label="$(registry_field "$slug" "label")"
+    email="$(profile_status "$slug")"
+    [[ -n "$label" ]] || label="$slug"
+    printf '  %b%-12s%b %s  %s\n' \
+      "$C_BLUE" "$slug" "$C_RESET" \
+      "$(color_status "$email")${email}${C_RESET}" \
+      "${C_DIM}${label}${C_RESET}"
+  done < <(registry_slugs 2>/dev/null || true)
+
+  printf '\n%b\n' "${C_BOLD}Notes${C_RESET}"
+  say_dim "  default is always the normal Cursor app. Other profiles are extra logins."
+  say_dim "  First launch of a profile: sign in, re-auth MCP servers, re-enter User Rules."
+  say_dim "  Shared across profiles: ~/.cursor  ~/.agents"
+  say_dim "  Isolated per profile: login, MCP OAuth, User Rules, editor settings"
+  printf '\n'
+}
+
+# --- commands ---------------------------------------------------------------
+
+list_accounts() {
+  ensure_registry
+  local default_mail
+  default_mail="$(profile_email "$(default_user_data_dir)")"
+  [[ -n "$default_mail" ]] || default_mail="(sign in via the Cursor app)"
+
+  printf '\n%b\n' "${C_BOLD}${C_CYAN}Cursor accounts${C_RESET}"
+  printf "${C_BOLD}%-14s %-32s %s${C_RESET}\n" "PROFILE" "SIGNED IN AS" "LABEL"
+  printf '%b\n' "${C_DIM}----------------------------------------------------------------${C_RESET}"
+  printf "${C_MAGENTA}${C_BOLD}%-14s${C_RESET} ${C_GREEN}%-32s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+    "default" "$default_mail" "Primary"
+
+  local slug label status
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    label="$(registry_field "$slug" "label")"
+    status="$(profile_status "$slug")"
+    [[ -n "$label" ]] || label="$slug"
+    printf "${C_BLUE}${C_BOLD}%-14s${C_RESET} $(color_status "$status")%-32s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+      "$slug" "$status" "$label"
+  done < <(registry_slugs)
+
+  printf '\n%b\n' "${C_DIM}Shared:${C_RESET} ${C_CYAN}~/.cursor${C_RESET}  ${C_CYAN}~/.agents${C_RESET}"
+}
+
+parse_kv_args() {
+  # Sets: SLUG LABEL EMAIL LAUNCH FORCE
+  SLUG=""
+  LABEL=""
+  EMAIL=""
+  LAUNCH=0
+  FORCE=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label)
+        [[ $# -ge 2 ]] || die "Missing value for --label"
+        LABEL="$2"
+        shift 2
+        ;;
+      --email)
+        [[ $# -ge 2 ]] || die "Missing value for --email"
+        EMAIL="$2"
+        shift 2
+        ;;
+      --launch)
+        LAUNCH=1
+        shift
+        ;;
+      --yes | -y | --force)
+        FORCE=1
+        shift
+        ;;
+      --help | -h)
+        show_help
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$SLUG" ]]; then
+          SLUG="$1"
+        elif [[ -z "$LABEL" ]]; then
+          LABEL="$1"
+        elif [[ -z "$EMAIL" ]]; then
+          EMAIL="$1"
+        else
+          die "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+}
+
+add_profile() {
+  parse_kv_args "$@"
+
+  if [[ -z "$SLUG" ]]; then
+    [[ -t 0 ]] || die "Usage: curs add <name> [--label TEXT] [--email ADDR] [--launch]"
+    read -r -p "$(printf '%b' "${C_BOLD}Profile name${C_RESET} (e.g. work): ")" SLUG
+    [[ -z "$LABEL" ]] && read -r -p "$(printf '%b' "${C_BOLD}Label${C_RESET} (optional): ")" LABEL
+    [[ -z "$EMAIL" ]] && read -r -p "$(printf '%b' "${C_BOLD}Email hint${C_RESET} (optional): ")" EMAIL
+  fi
+
+  assert_usable_slug "$SLUG"
+  if registry_exists "$SLUG"; then
+    die "Profile \"$SLUG\" already exists. Use: curs edit $SLUG"
+  fi
+  [[ -n "$LABEL" ]] || LABEL="$SLUG"
+
+  ensure_registry
+  registry upsert "$SLUG" label "$LABEL" email "$EMAIL"
+  say_ok "Created profile \"$SLUG\"."
+  [[ -n "$EMAIL" ]] && say_info "Sign-in hint: $EMAIL"
+
+  if [[ "$LAUNCH" -eq 1 ]]; then
+    launch_profile "$SLUG"
+  fi
+}
+
+edit_profile() {
+  parse_kv_args "$@"
+  [[ -n "$SLUG" ]] || die "Usage: curs edit <name> [--label TEXT] [--email ADDR]"
+  [[ "$SLUG" == "default" ]] && die "The primary profile cannot be edited. Launch it with: curs default"
+  registry_exists "$SLUG" || die "Unknown profile: $SLUG"
+
+  if [[ -z "$LABEL" && -z "$EMAIL" ]]; then
+    [[ -t 0 ]] || die "Usage: curs edit <name> [--label TEXT] [--email ADDR]"
+    read -r -p "$(printf '%b' "${C_BOLD}New label${C_RESET} (leave blank to keep): ")" LABEL
+    read -r -p "$(printf '%b' "${C_BOLD}Email hint${C_RESET} (leave blank to keep): ")" EMAIL
+  fi
+
+  local args=("$SLUG")
+  [[ -n "$LABEL" ]] && args+=(label "$LABEL")
+  [[ -n "$EMAIL" ]] && args+=(email "$EMAIL")
+  [[ ${#args[@]} -gt 1 ]] || die "Nothing to update."
+
+  ensure_registry
+  registry upsert "${args[@]}"
+  say_ok "Updated \"$SLUG\"."
+}
+
+remove_profile() {
+  parse_kv_args "$@"
+  [[ -n "$SLUG" ]] || die "Usage: curs rm <name> [--yes]"
+  [[ "$SLUG" == "default" ]] && die "The primary profile cannot be removed."
+  registry_exists "$SLUG" || [[ -d "$PROFILES_DIR/$SLUG" ]] || die "Unknown profile: $SLUG"
+
+  local dir="$PROFILES_DIR/$SLUG"
+  if [[ "$FORCE" -ne 1 ]]; then
+    [[ -t 0 ]] || die "Refusing to delete \"$SLUG\" without --yes."
+    read -r -p "Delete profile \"$SLUG\" and $dir? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { say_dim "Cancelled."; exit 0; }
+  fi
+
+  ensure_registry
+  registry remove "$SLUG"
+  rm -rf "$dir"
+  say_ok "Removed profile \"$SLUG\"."
+}
+
+seed_profile_settings() {
+  local dest="$1"
+  local src
+  src="$(default_user_data_dir)/User"
+  [[ -d "$src" ]] || return 0
+
+  mkdir -p "$dest/User"
+  local name
+  for name in settings.json keybindings.json; do
+    if [[ -f "$src/$name" && ! -f "$dest/User/$name" ]]; then
+      cp "$src/$name" "$dest/User/$name"
+    fi
+  done
+  if [[ -d "$src/snippets" && ! -d "$dest/User/snippets" ]]; then
+    cp -R "$src/snippets" "$dest/User/snippets"
+  fi
+}
+
+launch_profile() {
+  local slug="$1"
+  shift || true
+
+  local dir cursor_bin first=0
+  dir="$(profile_dir "$slug")"
+  cursor_bin="$(resolve_cursor_bin)"
+
+  if [[ "$slug" != "default" ]]; then
+    assert_usable_slug "$slug"
+    ensure_registry
+    if ! registry_exists "$slug"; then
+      registry upsert "$slug" label "$slug"
+    fi
+    mkdir -p "$dir"
+    if [[ ! -d "$dir/User" ]]; then
+      first=1
+      seed_profile_settings "$dir"
+    fi
+    registry touch "$slug"
+  fi
+
+  if [[ "$first" -eq 1 ]]; then
+    local hint
+    hint="$(registry_field "$slug" "email")"
+    printf '\n%b\n' "${C_YELLOW}${C_BOLD}First launch${C_RESET}  profile ${C_CYAN}${C_BOLD}${slug}${C_RESET}"
+    say_info "  1. Sign in with the Cursor account for this profile."
+    [[ -n "$hint" ]] && printf '%b\n' "${C_DIM}     Hint: ${C_GREEN}${hint}${C_RESET}"
+    say_info "  2. Re-authenticate MCP servers (Customize > MCP)."
+    say_info "  3. Re-enter User Rules (Customize > Rules). They live on the account."
+    printf '\n%b\n' "${C_DIM}Editor settings were copied from your primary profile.${C_RESET}"
+    printf '%b\n\n' "${C_DIM}Shared automatically:${C_RESET} ${C_CYAN}~/.cursor${C_RESET}  ${C_CYAN}~/.agents${C_RESET}"
+  fi
+
+  exec "$cursor_bin" --user-data-dir "$dir" "$@"
+}
+
+show_which() {
+  local slug="${1:-default}"
+  if [[ "$slug" != "default" ]]; then
+    if ! registry_exists "$slug" && [[ ! -d "$PROFILES_DIR/$slug" ]]; then
+      die "Unknown profile: $slug"
+    fi
+  fi
+  printf '%s\n' "$(profile_dir "$slug")"
+}
+
+install_self() {
+  local prefix="${PREFIX:-$HOME/.local}"
+  local dest="$prefix/bin/curs"
+  mkdir -p "$prefix/bin"
+  ln -sfn "$SCRIPT_PATH" "$dest"
+  say_ok "Installed $dest"
+  if ! command -v curs >/dev/null 2>&1; then
+    say_warn "Add $prefix/bin to PATH if curs is not found in new shells."
+  fi
+}
+
+complete_profiles() {
+  printf '%s\n' default
+  registry_slugs 2>/dev/null || true
+}
+
+complete_commands() {
+  printf '%s\n' add default edit help install list rm version which
+}
+
+pick_profile() {
+  ensure_registry
+
+  local default_mail
+  default_mail="$(profile_email "$(default_user_data_dir)")"
+  [[ -n "$default_mail" ]] || default_mail="primary Cursor install"
+
+  local -a slugs=()
+  local slug
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] && slugs+=("$slug")
+  done < <(registry_slugs)
+
+  local max=${#slugs[@]}
+  local choice
+
+  while true; do
+    printf '\n%b\n' "${C_BOLD}${C_CYAN}Cursor accounts${C_RESET}  ${C_DIM}(~/.cursor and ~/.agents shared)${C_RESET}"
+    printf '\n  %b0)%b %s     %s  %s\n' \
+      "$C_YELLOW" "$C_RESET" \
+      "${C_MAGENTA}${C_BOLD}default${C_RESET}" \
+      "${C_GREEN}${default_mail}${C_RESET}" \
+      "${C_DIM}(primary)${C_RESET}"
+
+    local i=1 s label email line
+    for s in "${slugs[@]}"; do
+      label="$(registry_field "$s" "label")"
+      email="$(profile_email "$PROFILES_DIR/$s")"
+      [[ -z "$email" ]] && email="$(registry_field "$s" "email")"
+      line="${C_BLUE}${C_BOLD}${s}${C_RESET}"
+      [[ -n "$label" && "$label" != "$s" ]] && line="$line ${C_DIM}-${C_RESET} ${C_DIM}${label}${C_RESET}"
+      [[ -n "$email" ]] && line="$line  ${C_GREEN}(${email})${C_RESET}"
+      printf '  %b%d)%b %b\n' "$C_YELLOW" "$i" "$C_RESET" "$line"
+      i=$((i + 1))
+    done
+
+    printf '\n  %bn)%b %bNew profile%b\n' "$C_YELLOW" "$C_RESET" "$C_GREEN" "$C_RESET"
+    printf '  %b?)%b %bHelp%b\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '  %bq)%b %bQuit%b\n\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
+
+    if ! read -r -p "$(printf '%b' "${C_BOLD}Choose${C_RESET} [0-$max, n, ?, q]: ")" choice; then
+      printf '\n'
+      exit 0
+    fi
+
+    case "$choice" in
+      q | Q) exit 0 ;;
+      '?' | help)
+        show_help
+        continue
+        ;;
+      n | N)
+        add_profile --launch
+        return
+        ;;
+      0)
+        launch_profile default
+        return
+        ;;
+      '' )
+        say_err "Pick a number, or n / ? / q."
+        continue
+        ;;
+      *[!0-9]*)
+        if valid_slug "$choice" && { registry_exists "$choice" || [[ -d "$PROFILES_DIR/$choice" ]]; }; then
+          launch_profile "$choice"
+          return
+        fi
+        say_err "Invalid choice: $choice"
+        continue
+        ;;
+      *)
+        if ((choice >= 1 && choice <= max)); then
+          launch_profile "${slugs[$((choice - 1))]}"
+          return
+        fi
+        say_err "Invalid choice: $choice"
+        continue
+        ;;
+    esac
+  done
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    pick_profile
+    return
+  fi
+
+  case "$1" in
+    -h | --help | help)
+      show_help
+      ;;
+    -v | --version | version)
+      show_version
+      ;;
+    --complete-profiles)
+      complete_profiles
+      ;;
+    --complete-commands)
+      complete_commands
+      ;;
+    list | ls)
+      list_accounts
+      ;;
+    add)
+      shift
+      add_profile "$@"
+      ;;
+    edit)
+      shift
+      edit_profile "$@"
+      ;;
+    rm | remove | delete)
+      shift
+      remove_profile "$@"
+      ;;
+    which)
+      shift
+      show_which "${1:-default}"
+      ;;
+    install)
+      install_self
+      ;;
+    default)
+      shift
+      launch_profile default "$@"
+      ;;
+    new)
+      shift
+      add_profile "$@" --launch
+      ;;
+    *)
+      local slug="$1"
+      shift
+      if [[ "$slug" == -* ]]; then
+        die "Unknown option: $slug. Try: curs help"
+      fi
+      if is_reserved_slug "$slug"; then
+        die "Unknown command: $slug. Try: curs help"
+      fi
+      ensure_registry
+      if valid_slug "$slug" && { registry_exists "$slug" || [[ -d "$PROFILES_DIR/$slug" ]]; }; then
+        launch_profile "$slug" "$@"
+      elif valid_slug "$slug"; then
+        if [[ ! -t 0 ]]; then
+          die "Unknown profile: $slug. Create it with: curs add $slug"
+        fi
+        read -r -p "Unknown profile \"$slug\". Create it? [Y/n] " create
+        [[ "$create" =~ ^[Nn]$ ]] && exit 1
+        add_profile "$slug"
+        launch_profile "$slug" "$@"
+      else
+        die "Unknown profile: $slug. Try: curs help"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
